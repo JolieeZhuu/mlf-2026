@@ -1,0 +1,26 @@
+name: mast3r
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.11
+  - cmake=3.14.0
+  - pytorch
+  - torchvision
+  - pytorch-cuda=12.1
+  - pip
+  - pip:
+      - open3d
+      - trimesh
+      - Pillow
+      - numpy
+      - opencv-python
+      - matplotlib
+      - tqdm
+      - scipy
+      # Optional: background removal
+      # - rembg
+      # - onnxruntime
