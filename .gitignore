@@ -1,0 +1,17 @@
+# Legacy ignores
+colmap/
+.venv
+
+# Large data directories
+Example/
+
+# MASt3R cloned repo & outputs
+mast3r_pipeline/mast3r/
+mast3r_pipeline/output/
+
+# Python
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
