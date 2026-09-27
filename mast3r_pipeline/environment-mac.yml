@@ -9,6 +9,8 @@ dependencies:
   - cmake
   - pytorch
   - torchvision
+  - jpeg
+  - libjpeg-turbo
   - pip
   - pip:
       - open3d

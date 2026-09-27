@@ -59,8 +59,18 @@ else
     conda activate mast3r
 fi
 
-echo "  Installing PyTorch and torchvision with native Apple Silicon (MPS) support..."
-conda install pytorch torchvision -c pytorch -y
+# Open3D on macOS ARM64 links dynamically to Homebrew's libusb
+if [ ! -f "/opt/homebrew/opt/libusb/lib/libusb-1.0.0.dylib" ]; then
+    echo "  Installing libusb via Homebrew (required by Open3D on macOS)..."
+    if command -v brew >/dev/null 2>&1; then
+        brew install libusb
+    else
+        echo "  WARNING: Homebrew not found. Open3D may require libusb from /opt/homebrew/opt/libusb/lib/libusb-1.0.0.dylib."
+    fi
+fi
+
+echo "  Installing PyTorch, torchvision, and image libraries..."
+conda install pytorch torchvision jpeg libjpeg-turbo -c pytorch -c conda-forge -y
 
 echo "  Installing MASt3R and DUSt3R requirements..."
 pip install -r "$MAST3R_DIR/requirements.txt"
