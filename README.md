@@ -1,4 +1,4 @@
-# MLF 2026
+# Voxcam
 
 3D reconstruction pipeline for volume estimation from video/images.
 
