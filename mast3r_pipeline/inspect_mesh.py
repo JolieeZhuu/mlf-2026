@@ -12,10 +12,18 @@ Usage:
 """
 
 import argparse
+import sys
 from pathlib import Path
 
-import trimesh
-import numpy as np
+try:
+    import trimesh
+    import numpy as np
+except ImportError as e:
+    print(f"Error: {e}")
+    print("\nRequired dependencies are not found in the current environment.")
+    print("Please activate the mast3r conda environment:")
+    print("    conda activate mast3r\n")
+    sys.exit(1)
 
 
 def load_mesh(path: Path):

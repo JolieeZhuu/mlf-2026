@@ -23,8 +23,12 @@ Prerequisites:
 """
 
 import argparse
+import os
 import sys
 from pathlib import Path
+
+# Enable CPU fallback for any unsupported MPS operators on Apple Silicon
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
 import numpy as np
 
@@ -34,7 +38,7 @@ MAST3R_DIR = SCRIPT_DIR / "mast3r"
 
 if not MAST3R_DIR.exists():
     print(f"ERROR: MASt3R not found at {MAST3R_DIR}")
-    print("Run setup_mast3r.ps1 first to clone and install MASt3R.")
+    print("Run setup_mast3r.sh (or setup_mast3r.ps1) first to clone and install MASt3R.")
     sys.exit(1)
 
 # Add MASt3R and DUSt3R to Python path
@@ -60,7 +64,21 @@ DEFAULT_MAX_IMAGES = 30       # Cap on number of images (GPU memory)
 DEFAULT_SCENE_GRAPH = "swin-5" # Scene graph type for pair selection
 
 
+def get_default_device() -> str:
+    """Auto-detect available acceleration device: cuda > mps > cpu."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return "cuda"
+        if torch.backends.mps.is_available():
+            return "mps"
+    except Exception:
+        pass
+    return "cpu"
+
+
 def parse_args():
+    default_device = get_default_device()
     parser = argparse.ArgumentParser(
         description="MASt3R 3D Reconstruction → TSDF → Watertight Mesh → Volume"
     )
@@ -127,15 +145,19 @@ def parse_args():
     parser.add_argument(
         "--device",
         type=str,
-        default="cuda",
-        help="Device to use: 'cuda' or 'cpu' (default: cuda).",
+        default=default_device,
+        choices=["cuda", "mps", "cpu", "auto"],
+        help=f"Device to use: 'cuda', 'mps', 'cpu', or 'auto' (default: {default_device}).",
     )
     parser.add_argument(
         "--skip_tsdf",
         action="store_true",
         help="Skip TSDF meshing; only export the raw point cloud.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.device == "auto":
+        args.device = default_device
+    return args
 
 
 # ── Lazy imports (only after sys.path is set) ───────────────────────
@@ -276,18 +298,52 @@ def extract_scene_data(scene, confidence_threshold: float):
 
     with torch.no_grad():
         pts3d_list = [p.cpu().numpy() for p in scene.get_pts3d()]
-        confidence_list = [c.cpu().numpy() for c in scene.get_confidence()]
-        poses = scene.get_im_poses().cpu().numpy()     # (N, 4, 4)
-        focals = scene.get_focals().cpu().numpy()       # (N,)
+
+        # Extract confidence maps: PointCloudOptimizer uses get_conf()
+        if hasattr(scene, "get_conf"):
+            confidence_list = [c.cpu().numpy() for c in scene.get_conf()]
+        elif hasattr(scene, "im_conf"):
+            confidence_list = [c.cpu().numpy() for c in scene.im_conf]
+        elif hasattr(scene, "get_confidence"):
+            confidence_list = [c.cpu().numpy() for c in scene.get_confidence()]
+        else:
+            confidence_list = [np.ones(p.shape[:2], dtype=np.float32) for p in pts3d_list]
+
+        poses_raw = scene.get_im_poses()
+        if isinstance(poses_raw, (list, tuple)):
+            poses = np.stack([p.cpu().numpy() for p in poses_raw])
+        else:
+            poses = poses_raw.cpu().numpy()     # (N, 4, 4)
+
+        focals_raw = scene.get_focals()
+        if isinstance(focals_raw, (list, tuple)):
+            focals = np.array([float(f.cpu().numpy().squeeze()) for f in focals_raw])
+        else:
+            focals = focals_raw.cpu().numpy().flatten()   # (N,)
+
+        # Extract optimized depthmaps if available
+        if hasattr(scene, "get_depthmaps"):
+            depthmaps = [d.cpu().numpy() for d in scene.get_depthmaps()]
+        else:
+            depthmaps = None
+
+        # Extract principal points if available
+        if hasattr(scene, "get_principal_points"):
+            pp_raw = scene.get_principal_points()
+            if isinstance(pp_raw, (list, tuple)):
+                pps = [p.cpu().numpy().squeeze() for p in pp_raw]
+            else:
+                pps = pp_raw.cpu().numpy()
+        else:
+            pps = None
 
     # Images are already numpy (H,W,3) in [0,1]
     colors_list = list(scene.imgs)
 
     # Build confidence masks
     masks = []
-    for conf in confidence_list:
-        mask = conf > confidence_threshold
-        # Also filter out non-finite points
+    for conf, pts in zip(confidence_list, pts3d_list):
+        mask = (conf > confidence_threshold) & np.all(np.isfinite(pts), axis=-1)
         masks.append(mask)
 
     total_pts = sum(m.sum() for m in masks)
@@ -300,6 +356,8 @@ def extract_scene_data(scene, confidence_threshold: float):
         "poses": poses,
         "focals": focals,
         "masks": masks,
+        "depthmaps": depthmaps,
+        "pps": pps,
     }
 
 
@@ -357,66 +415,116 @@ def tsdf_integrate(scene_data, voxel_length: float, sdf_trunc_mult: float = 5):
     Integrate per-view depth maps into a TSDF volume and extract mesh.
 
     The TSDF approach produces watertight meshes by construction.
+
+    Auto-scales voxel_length and depth_trunc based on the actual scene
+    geometry so that depths are not inadvertently discarded.
     """
     o3d = import_open3d()
 
-    sdf_trunc = voxel_length * sdf_trunc_mult
-
-    print(f"\nTSDF Integration (voxel={voxel_length}, trunc={sdf_trunc})...")
-
-    tsdf_volume = o3d.pipelines.integration.ScalableTSDFVolume(
-        voxel_length=voxel_length,
-        sdf_trunc=sdf_trunc,
-        color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8,
-    )
-
+    # ── First pass: compute global depth statistics to set parameters ──
     n_views = len(scene_data["pts3d_list"])
+    all_valid_depths = []
 
+    view_depths = []  # Store computed depths + metadata per view for reuse
     for i in range(n_views):
         pts3d = scene_data["pts3d_list"][i]    # (H, W, 3)
-        colors = scene_data["colors_list"][i]  # (H, W, 3)
         mask = scene_data["masks"][i]          # (H, W)
-        focal = scene_data["focals"][i]        # scalar
-        pose = scene_data["poses"][i]          # (4, 4) cam2world
+        pose = np.squeeze(scene_data["poses"][i])  # (4, 4) cam2world
 
         H, W, _ = pts3d.shape
-
-        # ── Derive per-pixel depth from the pointmap ──
-        # cam2world → world2cam
         extrinsic = np.linalg.inv(pose)
 
-        # Compute depth: transform points to camera coords, take Z
-        pts_flat = pts3d.reshape(-1, 3)  # (H*W, 3)
+        pts_flat = pts3d.reshape(-1, 3)
         ones = np.ones((pts_flat.shape[0], 1))
-        pts_homo = np.hstack([pts_flat, ones])  # (H*W, 4)
+        pts_homo = np.hstack([pts_flat, ones])
 
-        pts_cam = (extrinsic @ pts_homo.T).T[:, :3]  # (H*W, 3)
-        depth = pts_cam[:, 2].reshape(H, W)           # Z in camera frame
+        pts_cam = (extrinsic @ pts_homo.T).T[:, :3]
+        depth = pts_cam[:, 2].reshape(H, W)
 
-        # Clamp invalid depths
+        # Zero out invalid
         depth[~mask] = 0.0
         depth[~np.isfinite(depth)] = 0.0
         depth[depth < 0] = 0.0
 
-        # Build intrinsic matrix
+        valid = depth[depth > 0]
+        if len(valid) > 0:
+            all_valid_depths.append(valid)
+
+        view_depths.append({
+            "depth": depth,
+            "extrinsic": extrinsic,
+            "H": H, "W": W,
+        })
+
+    if len(all_valid_depths) == 0:
+        print("WARNING: No valid depths found across any view — TSDF will be empty.")
+        mesh = o3d.geometry.TriangleMesh()
+        return mesh
+
+    all_depths_concat = np.concatenate(all_valid_depths)
+    depth_min = float(np.min(all_depths_concat))
+    depth_max = float(np.max(all_depths_concat))
+    depth_median = float(np.median(all_depths_concat))
+    depth_p99 = float(np.percentile(all_depths_concat, 99))
+
+    print(f"\n  Depth statistics across {n_views} views:")
+    print(f"    min={depth_min:.4f}  median={depth_median:.4f}  "
+          f"max={depth_max:.4f}  p99={depth_p99:.4f}")
+
+    # ── Auto-scale voxel_length to scene extent ──
+    # Use the 99th-percentile depth as the "scene diameter" reference.
+    # Target ~500-800 voxels along the longest axis for a reasonable mesh.
+    auto_voxel = depth_p99 / 600.0
+    # Use the larger of user-specified and auto-computed voxel length
+    effective_voxel = max(voxel_length, auto_voxel)
+    sdf_trunc = effective_voxel * sdf_trunc_mult
+
+    # depth_trunc should encompass virtually all valid depths
+    depth_trunc = depth_p99 * 1.5
+
+    print(f"\nTSDF Integration:")
+    print(f"  Requested voxel_length = {voxel_length}")
+    print(f"  Auto-computed voxel    = {auto_voxel:.6f}")
+    print(f"  Effective voxel_length = {effective_voxel:.6f}")
+    print(f"  sdf_trunc              = {sdf_trunc:.6f}")
+    print(f"  depth_trunc            = {depth_trunc:.4f}")
+
+    tsdf_volume = o3d.pipelines.integration.ScalableTSDFVolume(
+        voxel_length=effective_voxel,
+        sdf_trunc=sdf_trunc,
+        color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8,
+    )
+
+    # ── Second pass: integrate each view ──
+    for i in range(n_views):
+        colors = scene_data["colors_list"][i]  # (H, W, 3)
+        focal = float(np.squeeze(scene_data["focals"][i]))
+
+        vd = view_depths[i]
+        H, W = vd["H"], vd["W"]
+        depth = vd["depth"]
+        extrinsic = vd["extrinsic"]
+
         cx, cy = W / 2.0, H / 2.0
         intrinsic = o3d.camera.PinholeCameraIntrinsic(W, H, focal, focal, cx, cy)
 
-        # Build RGBD image
-        color_img = (np.clip(colors, 0, 1) * 255).astype(np.uint8)
-        depth_img = depth.astype(np.float32)
+        color_img = np.ascontiguousarray((np.clip(colors, 0, 1) * 255).astype(np.uint8))
+        depth_img = np.ascontiguousarray(depth.astype(np.float32))
+        extrinsic_c = np.ascontiguousarray(extrinsic.astype(np.float64))
 
         rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
             o3d.geometry.Image(color_img),
             o3d.geometry.Image(depth_img),
             depth_scale=1.0,
-            depth_trunc=sdf_trunc * 20,  # generous truncation
+            depth_trunc=depth_trunc,
             convert_rgb_to_intensity=False,
         )
 
-        # Integrate into TSDF
-        tsdf_volume.integrate(rgbd, intrinsic, extrinsic)
-        print(f"  Integrated view {i + 1}/{n_views}")
+        tsdf_volume.integrate(rgbd, intrinsic, extrinsic_c)
+
+        valid_px = int(np.sum(depth > 0))
+        print(f"  Integrated view {i + 1}/{n_views}  "
+              f"(valid pixels: {valid_px:,})")
 
     # Extract mesh
     print("Extracting mesh from TSDF volume (Marching Cubes)...")
@@ -426,6 +534,12 @@ def tsdf_integrate(scene_data, voxel_length: float, sdf_trunc_mult: float = 5):
     n_verts = len(mesh.vertices)
     n_faces = len(mesh.triangles)
     print(f"TSDF mesh: {n_verts:,} vertices, {n_faces:,} faces")
+
+    if n_verts == 0:
+        print("WARNING: TSDF produced an empty mesh. This can happen when:")
+        print("  - The depth maps are noisy or sparse")
+        print("  - The voxel resolution is too fine for the scene scale")
+        print("  Falling back to Poisson reconstruction.")
 
     return mesh
 
@@ -469,6 +583,14 @@ def analyze_and_save(mesh, pcd, output_dir: Path, method_name: str):
     """Compute mesh properties and save to disk."""
     o3d = import_open3d()
     import trimesh
+
+    # Guard: skip saving / analysis if mesh is empty
+    n_verts = len(mesh.vertices)
+    n_faces = len(mesh.triangles)
+    if n_verts == 0 or n_faces == 0:
+        print(f"\nWARNING: {method_name} mesh is empty "
+              f"({n_verts} vertices, {n_faces} faces). Skipping save.")
+        return
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -566,9 +688,14 @@ def main():
         voxel_length=args.voxel_length,
         sdf_trunc_mult=DEFAULT_SDF_TRUNC_MULT,
     )
-    analyze_and_save(tsdf_mesh, pcd, args.output_dir, "tsdf")
 
-    # Step 6: Also try Poisson reconstruction as a backup/comparison
+    tsdf_ok = len(tsdf_mesh.vertices) > 0
+    if tsdf_ok:
+        analyze_and_save(tsdf_mesh, pcd, args.output_dir, "tsdf")
+    else:
+        print("\nTSDF mesh was empty — skipping TSDF analysis.")
+
+    # Step 6: Poisson reconstruction (always run as comparison / fallback)
     poisson_mesh = poisson_reconstruct(pcd)
     analyze_and_save(poisson_mesh, pcd, args.output_dir, "poisson")
 
