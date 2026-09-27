@@ -1,0 +1,25 @@
+name: mast3r
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.11
+  - cmake
+  - pytorch
+  - torchvision
+  - pip
+  - pip:
+      - open3d
+      - trimesh
+      - Pillow
+      - numpy
+      - opencv-python
+      - matplotlib
+      - tqdm
+      - scipy
+      - scikit-learn
+      - roma
+      - einops
+      - huggingface-hub[torch]
